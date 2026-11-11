@@ -6,8 +6,6 @@ Ubuntu/Debian için küçük ve bağımlılıksız bir program kaldırıcı. Kur
 APT uygulamaları, Snap paketleri, Flatpak uygulamaları, Docker imajları, AppImage dosyaları ve
 masaüstü kısayolları — sonra **onay kutularını işaretleyip seçtiklerinizi tek seferde kaldırmanızı** sağlar.
 
-![remover arayüzü](docs/screenshot.png)
-
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │ ⟳   Remover                                                  │

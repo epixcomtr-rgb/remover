@@ -6,8 +6,6 @@ A tiny, dependency-free uninstaller for Ubuntu/Debian. It lists everything you h
 APT applications, Snap packages, Flatpak apps, Docker images, AppImage files and desktop shortcuts —
 then lets you **tick checkboxes and remove the selected items in one go**.
 
-![remover GUI](docs/screenshot.png)
-
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │ ⟳   Remover                                                  │
