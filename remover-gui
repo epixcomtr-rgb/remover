@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+remover-gui — GTK4 / libadwaita arayüzü.
+
+Kurulu programları onay kutularıyla listeler; işaretlediklerini tek düğmeyle kaldırır.
+Çekirdek tarama/kaldırma mantığı `remover` (CLI) dosyasından içe aktarılır.
+
+Test: remover-gui --selftest   (pencereyi kurar, satır sayısını yazdırır, çıkar)
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import shutil
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+try:
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, GLib, Gtk, Pango  # noqa: E402
+except (ImportError, ValueError) as exc:  # pragma: no cover
+    print("GTK4/libadwaita bulunamadı: %s\nKurulum: sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1" % exc,
+          file=sys.stderr)
+    sys.exit(1)
+
+APP_ID = "tr.epix.Remover"
+APP_NAME = "Remover"
+DRY_RUN = bool(os.environ.get("REMOVER_DRY_RUN")) or "--dry-run" in sys.argv
+
+
+# ---------------------------------------------------------------- çekirdek modül
+def load_core():
+    """remover CLI dosyasını modül olarak yükler (uzantısız olduğu için elle)."""
+    here = Path(__file__).resolve().parent
+    for candidate in (here / "remover", Path("/usr/lib/remover/remover"), Path("/usr/bin/remover")):
+        if candidate.is_file():
+            spec = importlib.util.spec_from_loader(
+                "remover_core", importlib.machinery.SourceFileLoader("remover_core", str(candidate)))
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["remover_core"] = module   # dataclass'lar modül kaydı ister
+            spec.loader.exec_module(module)
+            return module
+    print("remover çekirdeği bulunamadı (/usr/lib/remover/remover).", file=sys.stderr)
+    sys.exit(1)
+
+
+CORE = load_core()
+Item = CORE.Item
+
+
+def human(mb: float) -> str:
+    return CORE.human(mb)
+
+
+# ---------------------------------------------------------------- yetki yardımı
+def privilege_runner():
+    """Tek seferde yetki isteyen bir çalıştırıcı döndürür: (komut listesi) -> (ok, çıktı)."""
+    if os.geteuid() == 0:
+        def direct(cmds: list[str]):
+            out = []
+            ok = True
+            for cmd in cmds:
+                proc = subprocess.run(cmd, shell=True, text=True, capture_output=True)
+                out.append(f"$ {cmd}\n{proc.stdout}{proc.stderr}")
+                ok = ok and proc.returncode == 0
+            return ok, "\n".join(out)
+        return direct
+
+    def pkexec(cmds: list[str]):
+        script = "set -e\n" + "\n".join(cmds)
+        if shutil.which("pkexec"):
+            proc = subprocess.run(["pkexec", "sh", "-c", script], text=True, capture_output=True)
+        else:
+            env = dict(os.environ, SUDO_ASKPASS=shutil.which("ssh-askpass") or "")
+            proc = subprocess.run(["sudo", "-S", "sh", "-c", script], text=True,
+                                  capture_output=True, input="\n")
+        return proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
+
+    return pkexec
+
+
+# ---------------------------------------------------------------- satır bileşeni
+class ProgramRow(Gtk.ListBoxRow):
+    def __init__(self, item: Item, on_toggle):
+        super().__init__()
+        self.item = item
+        self.on_toggle = on_toggle
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        box.set_margin_top(8)
+        box.set_margin_bottom(8)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+
+        self.check = Gtk.CheckButton()
+        self.check.set_active(False)
+        self.check.set_sensitive(not item.protected)
+        self.check.connect("toggled", lambda *_: on_toggle(item, self.check.get_active()))
+        box.append(self.check)
+
+        text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        text_box.set_hexpand(True)
+
+        title = Gtk.Label(label=item.name, xalign=0)
+        title.set_ellipsize(Pango.EllipsizeMode.END)
+        title.add_css_class("heading")
+        text_box.append(title)
+
+        subtitle_text = item.label if item.label and item.label != item.name else ""
+        meta = []
+        if item.size_mb:
+            meta.append(human(item.size_mb))
+        if item.runtime:
+            meta.append("runtime")
+        if item.note:
+            meta.append(item.note)
+        line2 = " · ".join([m for m in [subtitle_text] + meta if m])
+        if line2:
+            sub = Gtk.Label(label=line2, xalign=0)
+            sub.set_ellipsize(Pango.EllipsizeMode.END)
+            sub.add_css_class("dim-label")
+            text_box.append(sub)
+
+        box.append(text_box)
+
+        badge = Gtk.Label(label=item.kind)
+        badge.add_css_class("dim-label")
+        badge.add_css_class("caption")
+        box.append(badge)
+
+        if item.protected:
+            lock = Gtk.Label(label="korumalı")
+            lock.add_css_class("caption")
+            lock.add_css_class("error")
+            box.append(lock)
+
+        self.set_child(box)
+
+
+# ---------------------------------------------------------------- ana pencere
+class RemoverWindow(Adw.ApplicationWindow):
+    def __init__(self, app: Adw.Application):
+        super().__init__(application=app, title=APP_NAME, default_width=820, default_height=760)
+        self.set_size_request(560, 420)
+
+        self.items: list[Item] = []
+        self.rows: list[ProgramRow] = []
+        self.selected: dict[int, Item] = {}
+        self.busy = False
+
+        self.toolbar = Adw.ToolbarView()
+        self.set_content(self.toolbar)
+
+        # ---- başlık çubuğu
+        header = Adw.HeaderBar()
+        self.window_title = Adw.WindowTitle(title=APP_NAME, subtitle="Kurulu programlar")
+        header.set_title_widget(self.window_title)
+
+        refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
+        refresh_btn.set_tooltip_text("Listeyi yenile (F5)")
+        refresh_btn.connect("clicked", lambda *_: self.reload())
+        header.pack_start(refresh_btn)
+
+        self.terminal_btn = Gtk.ToggleButton(icon_name="utilities-terminal-symbolic")
+        self.terminal_btn.set_tooltip_text("İşlem günlüğü")
+        header.pack_end(self.terminal_btn)
+        self.toolbar.add_top_bar(header)
+
+        # ---- arama + toplu seçim
+        controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        controls.set_margin_top(8)
+        controls.set_margin_bottom(4)
+        controls.set_margin_start(12)
+        controls.set_margin_end(12)
+
+        self.search = Gtk.SearchEntry()
+        self.search.set_placeholder_text("Program ara…")
+        self.search.set_hexpand(True)
+        self.search.connect("search-changed", lambda *_: self.apply_filter())
+        controls.append(self.search)
+
+        self.all_btn = Gtk.Button(label="Tümünü seç")
+        self.all_btn.connect("clicked", lambda *_: self.toggle_all(True))
+        controls.append(self.all_btn)
+
+        none_btn = Gtk.Button(label="Temizle")
+        none_btn.connect("clicked", lambda *_: self.toggle_all(False))
+        controls.append(none_btn)
+
+        # ---- liste
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.toolbar.set_content(self.stack)
+
+        upper = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        upper.append(controls)
+
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.listbox.add_css_class("boxed-list")
+        self.listbox.set_margin_top(4)
+        self.listbox.set_margin_bottom(12)
+        self.listbox.set_margin_start(12)
+        self.listbox.set_margin_end(12)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_vexpand(True)
+        scroll.set_child(self.listbox)
+        upper.append(scroll)
+
+        self.stack.add_named(upper, "list")
+
+        self.empty = Adw.StatusPage(title="Program bulunamadı",
+                                    description="Liste boş ya da arama sonucu yok.",
+                                    icon_name="system-software-install-symbolic")
+        self.stack.add_named(self.empty, "empty")
+
+        # ---- işlem günlüğü
+        log_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        sw = Gtk.ScrolledWindow()
+        sw.set_vexpand(True)
+        self.log_view = Gtk.TextView()
+        self.log_view.set_editable(False)
+        self.log_view.set_monospace(True)
+        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.log_view.set_margin_top(8)
+        self.log_view.set_margin_bottom(8)
+        self.log_view.set_margin_start(12)
+        self.log_view.set_margin_end(12)
+        sw.set_child(self.log_view)
+        log_box.append(sw)
+        self.stack.add_named(log_box, "log")
+        self.terminal_btn.connect("toggled", self.on_terminal_toggled)
+
+        # ---- alt eylem çubuğu
+        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        bottom.set_margin_top(8)
+        bottom.set_margin_bottom(12)
+        bottom.set_margin_start(14)
+        bottom.set_margin_end(14)
+
+        self.summary = Gtk.Label(label="Hiç seçim yok", xalign=0)
+        self.summary.add_css_class("dim-label")
+        self.summary.set_hexpand(True)
+        bottom.append(self.summary)
+
+        self.spinner = Gtk.Spinner()
+        bottom.append(self.spinner)
+
+        self.remove_btn = Gtk.Button(label="Seçilenleri kaldır")
+        self.remove_btn.add_css_class("destructive-action")
+        self.remove_btn.set_sensitive(False)
+        self.remove_btn.connect("clicked", self.on_remove_clicked)
+        bottom.append(self.remove_btn)
+
+        self.toolbar.add_bottom_bar(bottom)
+
+        self.connect("close-request", self.on_close)
+        GLib.idle_add(self.reload)
+
+    # ------------------------------------------------------------- liste
+    def reload(self):
+        for row in list(self.rows):
+            self.listbox.remove(row)
+        self.rows.clear()
+        self.selected.clear()
+        self.update_summary()
+        self.window_title.set_subtitle("Taranıyor…")
+
+        def worker():
+            protected = CORE.load_config()
+            items = CORE.collect_all(protected)
+            GLib.idle_add(self.fill, items)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return False
+
+    def fill(self, items: list[Item]):
+        self.items = items
+        current_source = None
+        for item in items:
+            if item.source != current_source:
+                current_source = item.source
+                header = Gtk.ListBoxRow()
+                header.set_selectable(False)
+                header.set_activatable(False)
+                label = Gtk.Label(label=self.source_title(item.source), xalign=0)
+                label.add_css_class("heading")
+                label.set_margin_top(14)
+                label.set_margin_bottom(4)
+                label.set_margin_start(6)
+                header.set_child(label)
+                self.listbox.append(header)
+
+            row = ProgramRow(item, self.on_row_toggled)
+            self.rows.append(row)
+            self.listbox.append(row)
+
+        total = sum(i.size_mb for i in items)
+        removable = len([i for i in items if not i.protected])
+        self.window_title.set_subtitle(f"{len(items)} öğe · {removable} kaldırılabilir · {human(total)}")
+        self.stack.set_visible_child_name("list" if self.rows else "empty")
+        self.update_summary()
+        return False
+
+    @staticmethod
+    def source_title(source: str) -> str:
+        return {
+            "apt": "APT uygulamaları",
+            "snap": "Snap paketleri",
+            "flatpak": "Flatpak",
+            "docker": "Docker imajları",
+            "appimage": "AppImage dosyaları",
+            "desktop": "Kısayollar",
+        }.get(source, source.title())
+
+    # ------------------------------------------------------------- seçim
+    def on_row_toggled(self, item: Item, active: bool):
+        if active:
+            self.selected[item.number] = item
+        else:
+            self.selected.pop(item.number, None)
+        self.update_summary()
+
+    def toggle_all(self, active: bool):
+        for row in self.rows:
+            if row.get_parent() is None or row.item.protected:
+                continue
+            if not row.get_mapped() and active:
+                continue
+            row.check.set_active(active)
+
+    def update_summary(self):
+        count = len(self.selected)
+        total = sum(i.size_mb for i in self.selected.values())
+        if count:
+            self.summary.set_text(f"{count} öğe seçili · ~{human(total)}")
+        else:
+            self.summary.set_text("Hiç seçim yok")
+        self.remove_btn.set_sensitive(count > 0 and not self.busy)
+
+    def apply_filter(self):
+        needle = self.search.get_text().strip().lower()
+        visible_rows = 0
+        for row in self.rows:
+            match = (not needle) or needle in row.item.name.lower() or needle in row.item.label.lower()
+            row.set_visible(match)
+            if match:
+                visible_rows += 1
+        for child in list(self.listbox):
+            if isinstance(child, Gtk.ListBoxRow) and child not in self.rows:
+                child.set_visible(True)
+        self.stack.set_visible_child_name("list" if visible_rows else "empty")
+
+    # ------------------------------------------------------------- kaldırma
+    def on_remove_clicked(self, *_):
+        chosen = list(self.selected.values())
+        if not chosen:
+            return
+        total = sum(i.size_mb for i in chosen)
+        names = "\n".join(f"• {i.name}  ({human(i.size_mb) if i.size_mb else '—'})" for i in chosen[:12])
+        if len(chosen) > 12:
+            names += f"\n… ve {len(chosen) - 12} öğe daha"
+
+        dialog = Adw.MessageDialog(transient_for=self, modal=True,
+                                   heading=f"{len(chosen)} öğe kaldırılsın mı?",
+                                   body=f"Tahmini kazanç: {human(total)}\n\n{names}")
+        dialog.add_response("cancel", "Vazgeç")
+        dialog.add_response("remove", "Kaldır")
+        dialog.set_response_appearance("remove", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", self.on_confirm, chosen)
+        dialog.present()
+
+    def on_confirm(self, _dialog, response, chosen):
+        if response != "remove":
+            return
+        self.set_busy(True)
+        self.terminal_btn.set_active(True)
+        self.log(f"remover-gui · {len(chosen)} öğe kaldırılıyor")
+
+        def worker():
+            privileged_cmds, user_cmds = self.build_plan(chosen)
+            if DRY_RUN:
+                for cmd in privileged_cmds + user_cmds:
+                    GLib.idle_add(self.log, f"[dry-run] $ {cmd}")
+                GLib.idle_add(self.after_removal, True, 0.0, len(chosen))
+                return
+            apt_names = [i.name for i in chosen if i.source == "apt"]
+            ok_all = True
+            if user_cmds:
+                for cmd in user_cmds:
+                    GLib.idle_add(self.log, f"$ {cmd}")
+                    proc = subprocess.run(cmd, shell=True, text=True, capture_output=True)
+                    out = (proc.stdout or "") + (proc.stderr or "")
+                    if out.strip():
+                        GLib.idle_add(self.log, out.strip()[:2000])
+                    ok_all = ok_all and proc.returncode == 0
+            if privileged_cmds:
+                GLib.idle_add(self.log, "yetki isteniyor… (sudo/polkit)")
+                runner = privilege_runner()
+                ok, out = runner(privileged_cmds)
+                ok_all = ok_all and ok
+                for line in (out or "").splitlines()[-40:]:
+                    GLib.idle_add(self.log, line)
+
+            freed = sum(i.size_mb for i in chosen) if ok_all else 0.0
+            GLib.idle_add(self.after_removal, ok_all, freed, len(chosen))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def build_plan(self, chosen: list[Item]) -> tuple[list[str], list[str]]:
+        """Seçilen öğeler için (yetkili komutlar, kullanıcı komutları) üretir."""
+        privileged_cmds: list[str] = []
+        user_cmds: list[str] = []
+        apt_names = [i.name for i in chosen if i.source == "apt"]
+        if apt_names:
+            privileged_cmds.append("apt-get purge -y --autoremove " + " ".join(apt_names))
+        for item in chosen:
+            if item.source == "snap":
+                privileged_cmds.append("snap remove --purge " + item.name)
+            elif item.source == "flatpak":
+                user_cmds.append("flatpak uninstall -y " + item.name)
+            elif item.source == "docker":
+                user_cmds.append("docker rmi " + item.name)
+            elif item.source == "appimage":
+                user_cmds.append(f'rm -f "{item.name}"')
+            elif item.source == "desktop":
+                target = item.extra.get("path", item.name)
+                user_cmds.append(f'rm -f "{target}"')
+        return privileged_cmds, user_cmds
+
+    def after_removal(self, ok: bool, freed: float, count: int):
+        self.set_busy(False)
+        if ok:
+            self.log(f"✔ {count} öğe kaldırıldı · ~{human(freed)} boşaldı")
+        else:
+            self.log("✖ Bazı işlemler başarısız oldu; günlüğü inceleyin.")
+        self.reload()
+        return False
+
+    # ------------------------------------------------------------- yardımcı
+    def set_busy(self, busy: bool):
+        self.busy = busy
+        self.remove_btn.set_sensitive(not busy and bool(self.selected))
+        self.all_btn.set_sensitive(not busy)
+        if busy:
+            self.spinner.start()
+        else:
+            self.spinner.stop()
+
+    def log(self, text: str):
+        buf = self.log_view.get_buffer()
+        buf.insert(buf.get_end_iter(), text.rstrip() + "\n")
+        end = buf.get_end_iter()
+        self.log_view.scroll_to_iter(end, 0.0, False, 0.0, 1.0)
+        return False
+
+    def on_terminal_toggled(self, button):
+        active = button.get_active()
+        self.stack.set_visible_child_name("log" if active else "list")
+        if not active:
+            self.search.grab_focus()
+
+    def on_close(self, *_):
+        return False
+
+
+# ---------------------------------------------------------------- uygulama
+class RemoverApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=0)
+        self.window = None
+
+    def do_activate(self):
+        if not self.window:
+            self.window = RemoverWindow(self)
+            accel = Gtk.ShortcutController()
+            self.window.add_controller(accel)
+        self.window.present()
+
+
+def selftest() -> int:
+    """Pencereyi kurar, satır sayısını doğrular ve çıkar (CI/headless test)."""
+    app = Adw.Application(application_id=APP_ID + ".Test", flags=0)
+    result = {"rows": 0, "items": 0}
+
+    def on_activate(_app):
+        win = RemoverWindow(app)
+        win.present()
+
+        deadline = {"n": 0}
+
+        def check():
+            deadline["n"] += 1
+            if win.items or deadline["n"] > 40:          # ~20 s üst sınır
+                result["rows"] = len(win.rows)
+                result["items"] = len(win.items)
+                # onay kutusu mantığını da doğrula: ilk uygun iki satırı işaretle
+                picked = 0
+                for row in win.rows:
+                    if row.item.protected:
+                        continue
+                    row.check.set_active(True)
+                    picked += 1
+                    if picked == 2:
+                        break
+                summary = win.summary.get_text()
+                btn = win.remove_btn.get_sensitive()
+                print(f"selftest: {result['items']} öğe, {result['rows']} satır · "
+                      f"altbaşlık={win.window_title.get_subtitle()!r}")
+                print(f"selftest: 2 kutu işaretlendi → seçili={len(win.selected)}, "
+                      f"özet={summary!r}, buton_aktif={btn}")
+                priv, usr = win.build_plan(list(win.selected.values()))
+                print(f"selftest: plan → yetkili={len(priv)} komut, kullanıcı={len(usr)} komut")
+                for cmd in (priv + usr)[:3]:
+                    print(f"           $ {cmd}")
+                app.quit()
+                return False
+            return True
+
+        GLib.timeout_add(500, check)
+
+    app.connect("activate", on_activate)
+    GLib.timeout_add(500, lambda: app.activate() or False)
+    app.run([])
+    return 0 if result["items"] > 0 else 1
+
+
+def main(argv: list[str]) -> int:
+    if "--selftest" in argv:
+        return selftest()
+    if "--version" in argv:
+        print(f"remover-gui {CORE.VERSION}")
+        return 0
+    return RemoverApp().run([argv[0]])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

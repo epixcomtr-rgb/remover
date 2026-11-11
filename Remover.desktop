@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Remover
+Name[tr]=Remover — Program Kaldırıcı
+Comment=Checkbox list of installed programs; remove the ones you select
+Comment[tr]=Kurulu programları onay kutularıyla listeler, seçtiklerinizi kaldırır
+Exec=sh -c 'cd "$(dirname "%k")" && exec ./remover-gui'
+Icon=user-trash
+Terminal=false
+Categories=Utility;

@@ -1,0 +1,23 @@
+# derleme çıktıları
+build/
+*.deb
+*.tar.gz
+*.AppImage
+dist/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# editör / işletim sistemi
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# yerel dosyalar
+*.log
+.env
+s/
